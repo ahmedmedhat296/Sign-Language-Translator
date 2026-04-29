@@ -1,0 +1,7 @@
+tensorflow>=2.12
+mediapipe
+opencv-python
+pyttsx3
+pandas
+numpy
+kagglehub
