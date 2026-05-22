@@ -1,171 +1,210 @@
-#!/usr/bin/env python3
-"""
-train_model.py  -  Sign Language CNN Trainer
-Dataset : Sign Language MNIST  (27,455 train / 7,172 test, 28x28 px, 24 classes A-Y excl J/Z)
-Model   : CNN  ->  94%+ test accuracy
-"""
-
-import os, sys
+import os
 import numpy as np
-import pandas as pd
 import tensorflow as tf
-from tensorflow.keras import layers, models, callbacks
-from tensorflow.keras.utils import to_categorical
+from tensorflow.keras import layers, models, regularizers
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping, ModelCheckpoint
+import pandas as pd
 
-SEED        = 42
-NUM_CLASSES = 24
-IMG_SIZE    = 28
-EPOCHS      = 25
-BATCH_SIZE  = 64
-MODEL_PATH  = "sign_language_cnn.keras"
-DATA_DIR    = "data"
-LABELS      = list("ABCDEFGHIKLMNOPQRSTUVWXY")
-
+# ── Reproducibility ───────────────────────────────────────────
+SEED = 42
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
+# ── Config ────────────────────────────────────────────────────
+IMG_SIZE   = 28
+NUM_CLASSES = 24
+BATCH_SIZE  = 64
+EPOCHS      = 60
+MODEL_PATH  = "sign_language_cnn.keras"
 
-def ensure_data():
-    """Download Sign Language MNIST via kagglehub, then locate CSVs."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    train_csv = os.path.join(DATA_DIR, "sign_mnist_train.csv")
-    test_csv  = os.path.join(DATA_DIR, "sign_mnist_test.csv")
-
-    if os.path.exists(train_csv) and os.path.exists(test_csv):
-        print("  Data already present in data/")
-        return train_csv, test_csv
-
-    print("  Downloading Sign Language MNIST via kagglehub...")
-    import kagglehub
-    path = kagglehub.dataset_download("datamunge/sign-language-mnist")
-    print("  Downloaded to:", path)
-
-    # Find CSVs in the downloaded folder
-    import shutil
-    for root, dirs, files in os.walk(path):
-        for f in files:
-            if f.endswith(".csv"):
-                src = os.path.join(root, f)
-                dst = os.path.join(DATA_DIR, f)
-                shutil.copy2(src, dst)
-                print("  Copied:", f)
-
-    if not os.path.exists(train_csv) or not os.path.exists(test_csv):
-        # list what we got
-        for root, dirs, files in os.walk(DATA_DIR):
-            for f in files:
-                print("  Found:", os.path.join(root, f))
-        raise RuntimeError("Could not find sign_mnist_train.csv / sign_mnist_test.csv")
-
-    return train_csv, test_csv
+def remap_labels(labels):
+    """
+    Sign Language MNIST raw labels: 0-25 (letters A-Z), but J (9) and Z (25)
+    are excluded because they require motion. So the dataset has 24 classes:
+    labels 0-8 → classes 0-8, labels 10-25 → classes 9-23.
+    """
+    remapped = []
+    for l in labels:
+        if l < 9:
+            remapped.append(l)
+        elif l == 9:
+            # J should not appear in dataset, but just in case skip
+            remapped.append(-1)
+        else:
+            remapped.append(l - 1)   # 10→9, 11→10, ..., 25→24 — but 25 not in data
+    return np.array(remapped)
 
 
-def load_csv(path):
-    df = pd.read_csv(path)
-    labels = df["label"].values.astype(np.int32)
-    pixels = df.drop("label", axis=1).values.astype(np.float32)
-    images = pixels.reshape(-1, IMG_SIZE, IMG_SIZE)
-    return images, labels
+def preprocess_roi(image_28x28_gray):
+    """
+    Simulate the preprocessing that realtime.py will apply to webcam ROIs.
+    Applies CLAHE for contrast equalization and normalizes.
+    Since we can't apply CLAHE easily in keras layers, we do it in numpy
+    and apply augmentation on top.
+    """
+    import cv2
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    eq = clahe.apply(image_28x28_gray)
+    return eq.astype('float32') / 255.0
 
 
-def build_cnn():
+def load_data():
+    train_path = os.path.join("sing language mnist", "sign_mnist_train.csv")
+    test_path  = os.path.join("sing language mnist", "sign_mnist_test.csv")
+
+    if not os.path.exists(train_path) or not os.path.exists(test_path):
+        print(f"[ERROR] CSV files not found in 'sing language mnist' folder.")
+        raise SystemExit(1)
+
+    print(f"Reading {train_path}...")
+    train_df = pd.read_csv(train_path)
+    print(f"Reading {test_path}...")
+    test_df  = pd.read_csv(test_path)
+
+    y_train_raw = train_df['label'].values
+    x_train_raw = train_df.drop('label', axis=1).values.reshape(-1, IMG_SIZE, IMG_SIZE).astype('uint8')
+
+    y_test_raw  = test_df['label'].values
+    x_test_raw  = test_df.drop('label', axis=1).values.reshape(-1, IMG_SIZE, IMG_SIZE).astype('uint8')
+
+    print(f"Raw train: {x_train_raw.shape}, unique labels: {np.unique(y_train_raw)}")
+
+    # Remap labels
+    y_train = remap_labels(y_train_raw)
+    y_test  = remap_labels(y_test_raw)
+
+    # Remove any -1 labels (J class which shouldn't appear)
+    valid_train = y_train >= 0
+    valid_test  = y_test  >= 0
+    x_train_raw, y_train = x_train_raw[valid_train], y_train[valid_train]
+    x_test_raw,  y_test  = x_test_raw[valid_test],   y_test[valid_test]
+
+    # Apply CLAHE contrast equalization to match realtime preprocessing
+    import cv2
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    x_train = np.array([clahe.apply(img).astype('float32') / 255.0 for img in x_train_raw])
+    x_test  = np.array([clahe.apply(img).astype('float32') / 255.0 for img in x_test_raw])
+
+    x_train = x_train.reshape(-1, IMG_SIZE, IMG_SIZE, 1)
+    x_test  = x_test.reshape(-1,  IMG_SIZE, IMG_SIZE, 1)
+
+    y_train = tf.keras.utils.to_categorical(y_train, num_classes=NUM_CLASSES)
+    y_test  = tf.keras.utils.to_categorical(y_test,  num_classes=NUM_CLASSES)
+
+    print(f"Preprocessed train: {x_train.shape}, test: {x_test.shape}")
+    print(f"Remapped classes: {NUM_CLASSES}  (A-Y excluding J and Z)")
+    return x_train, y_train, x_test, y_test
+
+
+def build_model():
+    """
+    Deeper CNN with BatchNorm and L2 regularization to improve
+    generalization to real-world webcam conditions.
+    """
     model = models.Sequential([
         layers.Input(shape=(IMG_SIZE, IMG_SIZE, 1)),
 
-        layers.Conv2D(32, 3, padding="same", activation="relu"),
+        # Block 1
+        layers.Conv2D(32, (3, 3), padding='same', kernel_regularizer=regularizers.l2(1e-4)),
         layers.BatchNormalization(),
-        layers.Conv2D(32, 3, padding="same", activation="relu"),
-        layers.MaxPooling2D(2),
+        layers.Activation('relu'),
+        layers.Conv2D(32, (3, 3), padding='same', kernel_regularizer=regularizers.l2(1e-4)),
+        layers.BatchNormalization(),
+        layers.Activation('relu'),
+        layers.MaxPooling2D((2, 2)),
         layers.Dropout(0.25),
 
-        layers.Conv2D(64, 3, padding="same", activation="relu"),
+        # Block 2
+        layers.Conv2D(64, (3, 3), padding='same', kernel_regularizer=regularizers.l2(1e-4)),
         layers.BatchNormalization(),
-        layers.Conv2D(64, 3, padding="same", activation="relu"),
-        layers.MaxPooling2D(2),
+        layers.Activation('relu'),
+        layers.Conv2D(64, (3, 3), padding='same', kernel_regularizer=regularizers.l2(1e-4)),
+        layers.BatchNormalization(),
+        layers.Activation('relu'),
+        layers.MaxPooling2D((2, 2)),
         layers.Dropout(0.25),
 
+        # Block 3
+        layers.Conv2D(128, (3, 3), padding='same', kernel_regularizer=regularizers.l2(1e-4)),
+        layers.BatchNormalization(),
+        layers.Activation('relu'),
+        layers.MaxPooling2D((2, 2)),
+        layers.Dropout(0.25),
+
+        # Classifier head
         layers.Flatten(),
-        layers.Dense(256, activation="relu"),
-        layers.Dropout(0.4),
-        layers.Dense(NUM_CLASSES, activation="softmax"),
+        layers.Dense(256, kernel_regularizer=regularizers.l2(1e-4)),
+        layers.BatchNormalization(),
+        layers.Activation('relu'),
+        layers.Dropout(0.5),
+        layers.Dense(NUM_CLASSES, activation='softmax')
     ])
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-3),
-        loss="categorical_crossentropy",
-        metrics=["accuracy"],
-    )
     return model
 
 
-def main():
-    print("=" * 60)
-    print("  Sign Language CNN  -  Training")
-    print("=" * 60)
+def build_augmentation_pipeline():
+    """
+    Data augmentation that simulates webcam conditions:
+    - small rotations (hand tilt)
+    - small translations (hand not perfectly centered)
+    - small zoom variations
+    - horizontal flip (mirrored hand)
+    """
+    aug = tf.keras.Sequential([
+        layers.RandomRotation(0.1),           # ±36 degrees
+        layers.RandomTranslation(0.1, 0.1),   # ±10% shift
+        layers.RandomZoom((-0.1, 0.1)),        # ±10% zoom
+        layers.RandomFlip("horizontal"),       # mirror hand
+    ], name="augmentation")
+    return aug
 
-    train_csv, test_csv = ensure_data()
 
-    X_train, y_train = load_csv(train_csv)
-    X_test,  y_test  = load_csv(test_csv)
+def train():
+    x_train, y_train, x_test, y_test = load_data()
 
-    print("\n  Training images  : {:,}".format(len(X_train)))
-    print("  Test images      : {:,}".format(len(X_test)))
-    print("  Classes          : {}  ({})".format(NUM_CLASSES, "".join(LABELS)))
+    # Build augmentation + model pipeline
+    aug = build_augmentation_pipeline()
+    base_model = build_model()
 
-    # Remap labels 0..24 (skipping 9=J) to contiguous 0..23
-    unique = np.sort(np.unique(np.concatenate([y_train, y_test])))
-    remap  = {v: i for i, v in enumerate(unique)}
-    y_train = np.array([remap[v] for v in y_train], dtype=np.int32)
-    y_test  = np.array([remap.get(v, v) for v in y_test],  dtype=np.int32)
+    inputs  = tf.keras.Input(shape=(IMG_SIZE, IMG_SIZE, 1))
+    x       = aug(inputs, training=True)   # augmentation only active during training
+    outputs = base_model(x)
+    model   = tf.keras.Model(inputs, outputs)
 
-    X_train = X_train.reshape(-1, IMG_SIZE, IMG_SIZE, 1) / 255.0
-    X_test  = X_test.reshape(-1,  IMG_SIZE, IMG_SIZE, 1) / 255.0
-
-    Y_train = to_categorical(y_train, NUM_CLASSES)
-    Y_test  = to_categorical(y_test,  NUM_CLASSES)
-
-    aug = tf.keras.preprocessing.image.ImageDataGenerator(
-        rotation_range=10,
-        width_shift_range=0.1,
-        height_shift_range=0.1,
-        zoom_range=0.1,
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
     )
 
-    model = build_cnn()
     model.summary()
 
-    cb = [
-        callbacks.EarlyStopping(monitor="val_accuracy", patience=5,
-                                restore_best_weights=True, verbose=1),
-        callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
-                                    patience=2, verbose=1),
+    callbacks = [
+        ReduceLROnPlateau(monitor='val_accuracy', factor=0.5, patience=5,
+                          min_lr=1e-6, verbose=1),
+        EarlyStopping(monitor='val_accuracy', patience=12, restore_best_weights=True,
+                      verbose=1),
+        ModelCheckpoint(MODEL_PATH, monitor='val_accuracy', save_best_only=True,
+                        verbose=1),
     ]
 
-    print("\n  Training CNN...\n")
-    model.fit(
-        aug.flow(X_train, Y_train, batch_size=BATCH_SIZE, seed=SEED),
-        steps_per_epoch=len(X_train) // BATCH_SIZE,
+    print(f"\nTraining model (up to {EPOCHS} epochs, batch {BATCH_SIZE})...")
+    history = model.fit(
+        x_train, y_train,
         epochs=EPOCHS,
-        validation_data=(X_test, Y_test),
-        callbacks=cb,
-        verbose=1,
+        batch_size=BATCH_SIZE,
+        validation_data=(x_test, y_test),
+        callbacks=callbacks,
+        verbose=1
     )
 
-    loss, acc = model.evaluate(X_test, Y_test, verbose=0)
+    # Evaluate
+    loss, acc = model.evaluate(x_test, y_test, verbose=0)
+    print(f"\n[DONE] Final test accuracy: {acc*100:.2f}%  (loss: {loss:.4f})")
+    print(f"   Model saved to: {MODEL_PATH}")
 
-    print("\n" + "=" * 60)
-    print("  RESULTS")
-    print("=" * 60)
-    print("  Dataset          : Sign Language MNIST")
-    print("  Training images  : {:,}".format(len(X_train)))
-    print("  Test images      : {:,}".format(len(X_test)))
-    print("  Gesture Classes  : {}".format(NUM_CLASSES))
-    print("  Test Accuracy    : {:.2f}%".format(acc * 100))
-    print("  Test Loss        : {:.4f}".format(loss))
-
-    model.save(MODEL_PATH)
-    print("\n  Model saved -> {}".format(MODEL_PATH))
-    print("  Run  python realtime.py  to start the live translator.\n")
+    return history
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    train()
